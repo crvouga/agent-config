@@ -1,4 +1,4 @@
 interface:
   display_name: "Autopilot"
-  short_description: "Finish long tasks unattended with resumable progress"
-  default_prompt: "Use $autopilot to complete the following task while I am away. Make routine decisions independently, keep a durable checkpoint, and verify the result before finishing. Task: [describe the outcome]."
+  short_description: "Finish unattended tasks through a green, merge-ready PR"
+  default_prompt: "Use $autopilot to complete the following task while I am away, keeping a durable checkpoint and carrying repository changes through the full pr-green workflow to a verified, merge-ready PR without merging. Task: [describe the outcome]."

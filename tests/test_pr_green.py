@@ -28,6 +28,10 @@ def pr(**changes):
                      mergeStateStatus="CLEAN", reviewDecision="APPROVED"), **changes)
 
 
+def upsert_args(**changes):
+    return SimpleNamespace(**dict(dict(title_file=None, body_file=None, keep_draft=False), **changes))
+
+
 def check(bucket="pass", **changes):
     return dict(dict(name="test", bucket=bucket, state="SUCCESS", workflow="CI",
                      link="https://github.com/o/r/actions/runs/42/job/3"), **changes)
@@ -72,10 +76,16 @@ class ReadinessTests(unittest.TestCase):
     def test_actionable_work_precedes_approval_block(self):
         self.assertEqual(self.classify(pr=pr(reviewDecision="REVIEW_REQUIRED"), rows=[check("fail")]), "ACTION")
 
+    def test_unknown_review_decision_cannot_report_ready(self):
+        self.assertEqual(self.classify(pr=pr(reviewDecision="NEW_REQUIREMENT")), "BLOCKED")
+        for decision in ("", None):
+            self.assertEqual(self.classify(pr=pr(reviewDecision=decision)), "READY")
+
     def test_snapshot_rejects_head_or_metadata_races(self):
         for changed in (pr(headRefOid="new"), pr(body="new attestation"), pr(reviewDecision="CHANGES_REQUESTED")):
             ctx = SimpleNamespace(view=Mock(side_effect=[pr(), changed]), fetch=Mock(return_value=("base", "head")))
-            with patch.object(pg, "checks", return_value=[check()]), patch.object(pg, "threads", return_value=[]):
+            with patch.object(pg, "current_branch"), patch.object(pg, "checks", return_value=[check()]), \
+                 patch.object(pg, "threads", return_value=[]):
                 self.assertEqual(pg.snapshot(ctx)[0], "WAITING")
 
 
@@ -143,14 +153,63 @@ class GithubTests(unittest.TestCase):
             body.write_text("Evidence")
             ctx = SimpleNamespace(pr=pr(), view=Mock(return_value=pr()), selector="o/r")
             with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
-                pg.upsert(ctx, SimpleNamespace(title_file=str(title), body_file=str(body)))
+                pg.upsert(ctx, upsert_args(title_file=str(title), body_file=str(body)))
                 gh.assert_not_called()
 
     def test_new_pr_requires_metadata_before_push(self):
         with patch.object(pg, "sync") as sync:
             with self.assertRaises(pg.Stop):
-                pg.upsert(SimpleNamespace(pr=None), SimpleNamespace(title_file=None, body_file=None))
+                pg.upsert(SimpleNamespace(pr=None), upsert_args(title_file=None, body_file=None))
             sync.assert_not_called()
+
+    def test_upsert_preserves_concurrent_metadata_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = Path(d) / "body"
+            body.write_text("New evidence")
+            ctx = SimpleNamespace(pr=pr(), view=Mock(return_value=pr(body="Human update")), selector="o/r")
+            with patch.object(pg, "sync"), patch.object(pg, "gh") as gh:
+                with self.assertRaises(pg.Stop) as caught:
+                    pg.upsert(ctx, upsert_args(body_file=str(body)))
+            self.assertEqual(caught.exception.kind, "WAITING")
+            gh.assert_not_called()
+
+    def test_upsert_allows_concurrent_change_to_omitted_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = Path(d) / "body"
+            body.write_text("New evidence")
+            ctx = SimpleNamespace(pr=pr(), view=Mock(return_value=pr(title="Human title")), selector="o/r")
+            with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
+                pg.upsert(ctx, upsert_args(body_file=str(body)))
+            gh.assert_called_once_with("pr", "edit", "7", "--repo", "o/r", "--body-file", str(body))
+
+    def test_upsert_accepts_already_applied_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = Path(d) / "body"
+            body.write_text("New evidence")
+            ctx = SimpleNamespace(pr=pr(), view=Mock(return_value=pr(body="New evidence")), selector="o/r")
+            with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
+                pg.upsert(ctx, upsert_args(body_file=str(body)))
+            gh.assert_not_called()
+
+    def test_keep_draft_does_not_mark_existing_pr_ready(self):
+        ctx = SimpleNamespace(pr=pr(isDraft=True), view=Mock(return_value=pr(isDraft=True)))
+        with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
+            pg.upsert(ctx, upsert_args(keep_draft=True))
+        gh.assert_not_called()
+
+    def test_keep_draft_creates_draft_pr(self):
+        with tempfile.TemporaryDirectory() as d:
+            title, body = Path(d) / "title", Path(d) / "body"
+            title.write_text("Fix thing")
+            body.write_text("Evidence")
+            ctx = SimpleNamespace(pr=None, repo={"url": "https://github.com/o/r"},
+                                  push_repo={"url": "https://github.com/o/r"},
+                                  branch="feature", base="main", selector="o/r",
+                                  view=Mock(return_value=pr(isDraft=True)), find_pr=Mock(return_value=pr(isDraft=True)))
+            with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
+                pg.upsert(ctx, upsert_args(title_file=str(title), body_file=str(body), keep_draft=True))
+            gh.assert_called_once_with("pr", "create", "--repo", "o/r", "--head", "feature", "--base", "main",
+                                       "--title", "Fix thing", "--body-file", str(body), "--draft")
 
     def test_upsert_updates_only_changed_fields_and_marks_ready(self):
         with tempfile.TemporaryDirectory() as d:
@@ -158,7 +217,7 @@ class GithubTests(unittest.TestCase):
             body.write_text("Evidence\n- [x] Verified `literal` $(text)\n")
             ctx = SimpleNamespace(pr=pr(), view=Mock(return_value=pr(isDraft=True)), selector="o/r")
             with patch.object(pg, "sync"), patch.object(pg, "gh") as gh, contextlib.redirect_stdout(io.StringIO()):
-                pg.upsert(ctx, SimpleNamespace(title_file=None, body_file=str(body)))
+                pg.upsert(ctx, upsert_args(title_file=None, body_file=str(body)))
             self.assertEqual(gh.call_args_list[0].args,
                              ("pr", "edit", "7", "--repo", "o/r", "--body-file", str(body)))
             self.assertEqual(gh.call_args_list[1].args, ("pr", "ready", "7", "--repo", "o/r"))
@@ -174,14 +233,14 @@ class GithubTests(unittest.TestCase):
                                   find_pr=Mock(return_value=pr()))
             with patch.object(pg, "sync"), patch.object(pg, "gh", side_effect=pg.Stop("already exists")) as gh, \
                  contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(pg.upsert(ctx, SimpleNamespace(title_file=str(title), body_file=str(body))), 0)
+                self.assertEqual(pg.upsert(ctx, upsert_args(title_file=str(title), body_file=str(body))), 0)
             self.assertIn("fork:feature", gh.call_args.args)
             self.assertIn("release", gh.call_args.args)
             self.assertEqual(gh.call_count, 1)
 
     def test_published_head_guard_rejects_unpushed_fix_before_resolve(self):
         ctx = SimpleNamespace(view=Mock(return_value=pr()), remote="origin", branch="feature")
-        with patch.object(pg, "clean"), patch.object(pg, "git", side_effect=["head refs/heads/feature", "local-fix"]):
+        with patch.object(pg, "clean"), patch.object(pg, "git", side_effect=["feature", "head refs/heads/feature", "local-fix"]):
             with self.assertRaises(pg.Stop) as caught:
                 pg.published_head(ctx, "head")
         self.assertEqual(caught.exception.kind, "WAITING")
@@ -300,6 +359,27 @@ class GitIntegrationTests(unittest.TestCase):
             pg.sync(self.ctx)
         self.assertEqual(Path("user-file").read_text(), "keep me")
         self.assertEqual(pg.git("ls-remote", "origin", "refs/heads/feature"), before)
+
+    def test_branch_switch_during_fetch_does_not_merge_or_push(self):
+        original = self.ctx.fetch
+        before = pg.git("ls-remote", "origin", "refs/heads/feature")
+        main = pg.git("rev-parse", "main")
+        def fetch_then_switch():
+            result = original()
+            pg.git("checkout", "main")
+            return result
+        self.ctx.fetch = fetch_then_switch
+        with self.assertRaisesRegex(pg.Stop, "Local branch changed"):
+            pg.sync(self.ctx)
+        self.assertEqual(pg.git("rev-parse", "main"), main)
+        self.assertEqual(pg.git("ls-remote", "origin", "refs/heads/feature"), before)
+
+    def test_published_head_rejects_other_branch_at_same_commit(self):
+        head = pg.git("rev-parse", "HEAD")
+        self.ctx.view = Mock(return_value=pr(headRefOid=head))
+        pg.git("checkout", "-b", "other-branch")
+        with self.assertRaisesRegex(pg.Stop, "Local branch changed"):
+            pg.published_head(self.ctx, head)
 
     def test_conflict_keeps_remote_unchanged_and_exposes_action(self):
         self.commit("seed", "feature version\n")

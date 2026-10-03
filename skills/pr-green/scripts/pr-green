@@ -72,6 +72,11 @@ def clean():
             raise Stop(f"Finish the existing {marker} operation first.", "ACTION")
 
 
+def current_branch(ctx):
+    if git("branch", "--show-current") != ctx.branch:
+        raise Stop("Local branch changed during discovery; retry from the intended branch.", "BLOCKED")
+
+
 def repo_info(selector=None):
     return gh_json("repo", "view", *([selector] if selector else []),
                    "--json", "nameWithOwner,url,defaultBranchRef")
@@ -183,17 +188,22 @@ def mutation_lock(ctx):
 
 def sync(ctx):
     clean()
-    if git("branch", "--show-current") != ctx.branch:
-        raise Stop("Local branch changed during discovery; retry from the intended branch.", "BLOCKED")
+    current_branch(ctx)
     if ctx.pr:
         ctx.view()
     base, remote = ctx.fetch()
+    current_branch(ctx)
+    clean()
     for tip in (remote, base):
         if tip and not ancestor(tip, "HEAD"):
             proc = run("git", "merge", "--no-edit", tip, ok=(0, 1), timeout=180)
             if proc.returncode:
                 raise Stop("Resolve and validate the merge, stage only resolved paths, then git merge --continue. " +
                            (proc.stderr or proc.stdout)[-1500:], "ACTION")
+    current_branch(ctx)
+    clean()
+    if ctx.pr:
+        ctx.view()
     head = git("rev-parse", "HEAD")
     if remote != head:
         git("push", "--", ctx.remote, f"HEAD:refs/heads/{ctx.branch}", timeout=180)
@@ -214,6 +224,9 @@ def upsert(ctx, args):
     if ctx.pr:
         fresh = ctx.view()
         edits = []
+        for field, desired in (("title", title), ("body", body)):
+            if desired is not None and fresh[field] not in (ctx.pr[field], desired):
+                raise Stop(f"PR {field} changed during sync; reread it and reconcile before retrying.", "WAITING")
         if title is not None and title != fresh["title"]:
             edits += ["--title", title]
         if body is not None and body != fresh["body"]:
@@ -224,7 +237,8 @@ def upsert(ctx, args):
         head = ctx.branch if same_repo(ctx.repo, ctx.push_repo) else ctx.push_repo["nameWithOwner"].split("/")[0] + ":" + ctx.branch
         try:
             gh("pr", "create", "--repo", ctx.selector, "--head", head, "--base", ctx.base,
-               "--title", title, "--body-file", args.body_file)
+               "--title", title, "--body-file", args.body_file,
+               *(["--draft"] if args.keep_draft else []))
         except Stop:
             # Creation may have succeeded before a network error, or another writer won.
             ctx.pr = ctx.find_pr()
@@ -234,7 +248,7 @@ def upsert(ctx, args):
         if not ctx.pr:
             raise Stop("PR creation returned but the PR is not visible yet.", "WAITING")
     fresh = ctx.view()
-    if fresh["isDraft"]:
+    if fresh["isDraft"] and not args.keep_draft:
         gh("pr", "ready", str(fresh["number"]), "--repo", ctx.selector)
     return emit("DONE", pr=fresh["url"], next="wait")
 
@@ -302,6 +316,8 @@ def classify(pr, rows, unresolved, local, base, remote, contains_base, dirty):
         return "WAITING", ["Checks are pending or unknown"]
     if pr["reviewDecision"] in {"REVIEW_REQUIRED", "CHANGES_REQUESTED"}:
         return "BLOCKED", ["Review approval or reviewer action required"]
+    if pr["reviewDecision"] not in {"APPROVED", "", None}:
+        return "BLOCKED", ["Unrecognized review decision; inspect the review requirement"]
     if pr["mergeable"] == "UNKNOWN" or pr["mergeStateStatus"] == "UNKNOWN":
         return "WAITING", ["GitHub is computing mergeability"]
     if pr["mergeable"] == "MERGEABLE" and pr["mergeStateStatus"] == "CLEAN":
@@ -310,9 +326,11 @@ def classify(pr, rows, unresolved, local, base, remote, contains_base, dirty):
 
 
 def snapshot(ctx):
+    current_branch(ctx)
     before = ctx.view()
     rows, unresolved, tips = parallel(lambda: checks(ctx), lambda: threads(ctx), ctx.fetch)
     after = ctx.view()
+    current_branch(ctx)
     base, remote = tips
     # Any PR metadata change invalidates this observation, not just a changed SHA.
     if before != after:
@@ -401,6 +419,7 @@ def logs(ctx, limit):
 
 
 def published_head(ctx, expected):
+    current_branch(ctx)
     clean()
     pr = ctx.view()
     remote = git("ls-remote", "--heads", ctx.remote, f"refs/heads/{ctx.branch}").split()
@@ -450,6 +469,8 @@ def parser():
         if name == "upsert":
             sub.add_argument("--title-file")
             sub.add_argument("--body-file")
+            sub.add_argument("--keep-draft", action="store_true",
+                             help="create as draft or preserve an existing draft; never convert a ready PR to draft")
         if name == "wait":
             sub.add_argument("--seconds", type=int, default=45, choices=range(0, 61), metavar="0..60")
         if name == "logs":
