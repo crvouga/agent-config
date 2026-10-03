@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR green"
+  short_description: "Upsert, repair, and verify a merge-ready PR"
+  default_prompt: "Use $pr-green to get this branch's PR green and ready to merge, handling attestations autonomously."
