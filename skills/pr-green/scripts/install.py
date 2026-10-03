@@ -10,7 +10,9 @@ import shutil
 def backup(path):
     if path.exists() or path.is_symlink():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        saved = path.with_name(path.name + ".backup-" + stamp)
+        folder = path.parent.parent / "skill-backups" if path.parent.name == "skills" else path.parent
+        folder.mkdir(parents=True, exist_ok=True)
+        saved = folder / (path.name + ".backup-" + stamp)
         path.rename(saved)
         print(f"Backed up {path} to {saved}")
 
@@ -44,16 +46,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home(), help="installation home (also useful for testing)")
     args = parser.parse_args()
+    home = args.home.expanduser().resolve()
     source = Path(__file__).resolve().parents[1]
-    dest = args.home.expanduser().resolve() / ".agents/skills/pr-green"
+    dest = home / ".agents/skills/pr-green"
     dest.parent.mkdir(parents=True, exist_ok=True)
     if source != dest.resolve():
         backup(dest)
         shutil.copytree(source, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (dest / "scripts/pr-green").chmod(0o755)
-    link(dest, args.home / ".codex/skills/pr-green")
-    link(dest / "scripts/pr-green", args.home / ".local/bin/pr-green")
-    refresh_existing_commands(args.home, dest)
+    link(dest, home / ".codex/skills/pr-green")
+    link(dest / "scripts/pr-green", home / ".local/bin/pr-green")
+    refresh_existing_commands(home, dest)
     print(f"Installed {dest}")
 
 

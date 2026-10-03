@@ -347,7 +347,7 @@ class InstallTests(unittest.TestCase):
                 subprocess.run(command, check=True, capture_output=True)
             self.assertTrue((home / ".codex/skills/pr-green/SKILL.md").is_file())
             self.assertTrue((home / ".local/bin/pr-green").is_file())
-            self.assertEqual(len(list(dest.parent.glob("pr-green.backup-*/old-marker"))), 1)
+            self.assertEqual(len(list((home / ".agents/skill-backups").glob("pr-green.backup-*/old-marker"))), 1)
             self.assertIn(str(dest / "SKILL.md"), shim.read_text())
             self.assertEqual(len(list(shim.parent.glob("pr-green.md.backup-*"))), 1)
 
