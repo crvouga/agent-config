@@ -1,0 +1,4 @@
+interface:
+  display_name: "Autopilot"
+  short_description: "Finish long tasks unattended with resumable progress"
+  default_prompt: "Use $autopilot to complete the following task while I am away. Make routine decisions independently, keep a durable checkpoint, and verify the result before finishing. Task: [describe the outcome]."
