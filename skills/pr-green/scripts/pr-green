@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Deterministic PR mechanics. Python standard library only; never merges a PR."""
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse
+
+FIELDS = "number,url,state,isDraft,title,body,headRefName,headRefOid,baseRefName,baseRefOid,headRepository,headRepositoryOwner,mergeable,mergeStateStatus,reviewDecision"
+EXITS = {"READY": 0, "DONE": 0, "ERROR": 1, "ACTION": 2, "BLOCKED": 3, "WAITING": 4}
+
+
+class Stop(Exception):
+    def __init__(self, message, kind="ERROR"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def run(*args, ok=(0,), input=None, timeout=90):
+    env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_PAGER="cat",
+               GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true", GIT_MERGE_AUTOEDIT="no")
+    proc = subprocess.run(args, input=input, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    if proc.returncode not in ok:
+        raise Stop((proc.stderr or proc.stdout or f"{args[0]} failed")[-2500:].strip())
+    return proc
+
+
+def git(*args, **kwargs):
+    return run("git", *args, **kwargs).stdout.strip()
+
+
+def gh(*args, **kwargs):
+    return run("gh", *args, **kwargs).stdout
+
+
+def gh_json(*args):
+    return json.loads(gh(*args))
+
+
+def parallel(*calls):
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        futures = [pool.submit(call) for call in calls]
+        # Exiting the pool joins all reads even when one fails.
+        return [future.result() for future in futures]
+
+
+def emit(kind, **facts):
+    print(json.dumps(dict(result=kind, **facts), ensure_ascii=False, separators=(",", ":")), flush=True)
+    return EXITS[kind]
+
+
+def ancestor(older, newer):
+    return run("git", "merge-base", "--is-ancestor", older, newer, ok=(0, 1)).returncode == 0
+
+
+def clean():
+    if git("status", "--porcelain"):
+        raise Stop("Working tree has uncommitted changes; commit task-owned paths or finish conflicts first.", "ACTION")
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
+        if Path(git("rev-parse", "--git-path", marker)).exists():
+            raise Stop(f"Finish the existing {marker} operation first.", "ACTION")
+
+
+def repo_info(selector=None):
+    return gh_json("repo", "view", *([selector] if selector else []),
+                   "--json", "nameWithOwner,url,defaultBranchRef")
+
+
+def same_repo(left, right):
+    return left["url"].rstrip("/").lower() == right["url"].rstrip("/").lower()
+
+
+class Context:
+    def __init__(self, base=None):
+        self.root = Path(git("rev-parse", "--show-toplevel"))
+        self.branch = git("branch", "--show-current")
+        if not self.branch:
+            raise Stop("Detached HEAD; operate in the intended PR branch.", "BLOCKED")
+        self.remote = os.environ.get("PR_GREEN_REMOTE", "origin")
+        push_urls = git("remote", "get-url", "--push", "--all", self.remote).splitlines()
+        fetch_url = git("remote", "get-url", self.remote)
+        if len(push_urls) != 1:
+            raise Stop("Push remote must have exactly one push URL.", "BLOCKED")
+        self.repo, self.push_repo = parallel(repo_info, lambda: repo_info(push_urls[0]))
+        fetch_repo = self.push_repo if fetch_url == push_urls[0] else repo_info(fetch_url)
+        if not same_repo(fetch_repo, self.push_repo):
+            raise Stop("Fetch and push URLs identify different repositories.", "BLOCKED")
+        self.slug = self.repo["nameWithOwner"]
+        self.host = urlparse(self.repo["url"]).hostname
+        if self.host != urlparse(self.push_repo["url"]).hostname:
+            raise Stop("Base and head repositories are on different hosts.", "BLOCKED")
+        self.selector = self.repo["url"]
+        self.base_override = base
+        self.cache = Path(git("rev-parse", "--absolute-git-dir")) / "pr-green"
+        self.cache.mkdir(exist_ok=True)
+        # Private refs are unique across linked worktrees sharing a branch name.
+        key = hashlib.sha256(str(self.cache).encode()).hexdigest()[:16]
+        self.base_ref = f"refs/pr-green/{key}/base"
+        self.head_ref = f"refs/pr-green/{key}/head"
+        self.pr = self.find_pr()
+        self.base = self.pr["baseRefName"] if self.pr else base or (self.repo.get("defaultBranchRef") or {}).get("name")
+        if not self.base:
+            raise Stop("Repository has no default branch yet; initialize its base or specify --base BRANCH.", "ACTION")
+        git("check-ref-format", "--branch", self.base)
+        if self.branch == self.base and same_repo(self.repo, self.push_repo):
+            raise Stop("Current branch is the base branch.", "BLOCKED")
+
+    def matches(self, pr):
+        head = pr.get("headRepository") or {}
+        owner = (pr.get("headRepositoryOwner") or {}).get("login", "")
+        return (pr["headRefName"] == self.branch and
+                f"{owner}/{head.get('name', '')}".lower() == self.push_repo["nameWithOwner"].lower())
+
+    def find_pr(self):
+        items = gh_json("pr", "list", "--repo", self.selector, "--head", self.branch,
+                        "--state", "open", "--limit", "100", "--json", FIELDS)
+        if len(items) == 100:
+            raise Stop("PR search reached its limit; narrow the branch selection.", "BLOCKED")
+        matches = [p for p in items if self.matches(p)]
+        selected = [p for p in matches if not self.base_override or p["baseRefName"] == self.base_override]
+        if matches and not selected:
+            raise Stop("Existing PR targets a different base; refusing silent retarget.", "BLOCKED")
+        if len(selected) > 1:
+            raise Stop("Multiple open PRs for this branch; specify --base.", "BLOCKED")
+        return selected[0] if selected else None
+
+    def view(self):
+        if not self.pr:
+            raise Stop("No open PR; run upsert with title and body files.", "ACTION")
+        pr = gh_json("pr", "view", str(self.pr["number"]), "--repo", self.selector, "--json", FIELDS)
+        if pr["state"] != "OPEN":
+            raise Stop("PR is no longer open; rediscover the intended PR before continuing.", "BLOCKED")
+        if not self.matches(pr) or pr["baseRefName"] != self.base:
+            raise Stop("PR head or base selection changed; rediscover before continuing.", "WAITING")
+        return pr
+
+    def api(self, path, *args):
+        return gh_json("api", "--hostname", self.host, path, *args)
+
+    def graphql(self, query, **variables):
+        data = json.loads(gh("api", "--hostname", self.host, "graphql", "--input", "-",
+                             input=json.dumps(dict(query=query, variables=variables))))
+        if data.get("errors"):
+            raise Stop(str(data["errors"]))
+        return data["data"]
+
+    def fetch(self):
+        # Force only the private tracking ref, never a branch or push.
+        source = self.remote if same_repo(self.repo, self.push_repo) else self.repo["url"]
+        git("fetch", "--no-tags", source, f"+refs/heads/{self.base}:{self.base_ref}")
+        listed = git("ls-remote", "--heads", self.remote, f"refs/heads/{self.branch}")
+        if listed:
+            git("fetch", "--no-tags", self.remote, f"+refs/heads/{self.branch}:{self.head_ref}")
+        return git("rev-parse", self.base_ref), git("rev-parse", self.head_ref) if listed else None
+
+
+@contextmanager
+def mutation_lock(ctx):
+    # A crash leaves an explicit diagnostic instead of permitting overlapping writers.
+    path = ctx.cache / "mutation.lock"
+    try:
+        path.mkdir()
+    except FileExistsError:
+        raise Stop(f"Another mutation may be running. Inspect {path}; remove only after verifying no writer remains.", "BLOCKED")
+    try:
+        (path / "pid").write_text(str(os.getpid()))
+        yield
+    finally:
+        (path / "pid").unlink(missing_ok=True)
+        path.rmdir()
+
+
+def sync(ctx):
+    clean()
+    if git("branch", "--show-current") != ctx.branch:
+        raise Stop("Local branch changed during discovery; retry from the intended branch.", "BLOCKED")
+    if ctx.pr:
+        ctx.view()
+    base, remote = ctx.fetch()
+    for tip in (remote, base):
+        if tip and not ancestor(tip, "HEAD"):
+            proc = run("git", "merge", "--no-edit", tip, ok=(0, 1), timeout=180)
+            if proc.returncode:
+                raise Stop("Resolve and validate the merge, stage only resolved paths, then git merge --continue. " +
+                           (proc.stderr or proc.stdout)[-1500:], "ACTION")
+    head = git("rev-parse", "HEAD")
+    if remote != head:
+        git("push", "--", ctx.remote, f"HEAD:refs/heads/{ctx.branch}", timeout=180)
+    published = git("ls-remote", "--heads", ctx.remote, f"refs/heads/{ctx.branch}").split()
+    if not published or published[0] != head:
+        raise Stop("Remote head moved during sync; rediscover and integrate it.", "WAITING")
+    return head
+
+
+def upsert(ctx, args):
+    title = Path(args.title_file).read_text().strip() if args.title_file else None
+    body = Path(args.body_file).read_text() if args.body_file else None
+    if title is not None and (not title or "\n" in title):
+        raise Stop("Title file must contain one nonempty line.")
+    if not ctx.pr and (title is None or body is None or not body.strip()):
+        raise Stop("A new PR requires --title-file and --body-file; inspect the diff and template first.", "ACTION")
+    sync(ctx)
+    if ctx.pr:
+        fresh = ctx.view()
+        edits = []
+        if title is not None and title != fresh["title"]:
+            edits += ["--title", title]
+        if body is not None and body != fresh["body"]:
+            edits += ["--body-file", args.body_file]
+        if edits:
+            gh("pr", "edit", str(fresh["number"]), "--repo", ctx.selector, *edits)
+    else:
+        head = ctx.branch if same_repo(ctx.repo, ctx.push_repo) else ctx.push_repo["nameWithOwner"].split("/")[0] + ":" + ctx.branch
+        try:
+            gh("pr", "create", "--repo", ctx.selector, "--head", head, "--base", ctx.base,
+               "--title", title, "--body-file", args.body_file)
+        except Stop:
+            # Creation may have succeeded before a network error, or another writer won.
+            ctx.pr = ctx.find_pr()
+            if not ctx.pr:
+                raise
+        ctx.pr = ctx.find_pr()
+        if not ctx.pr:
+            raise Stop("PR creation returned but the PR is not visible yet.", "WAITING")
+    fresh = ctx.view()
+    if fresh["isDraft"]:
+        gh("pr", "ready", str(fresh["number"]), "--repo", ctx.selector)
+    return emit("DONE", pr=fresh["url"], next="wait")
+
+
+def checks(ctx):
+    proc = run("gh", "pr", "checks", str(ctx.pr["number"]), "--repo", ctx.selector,
+               "--json", "name,state,bucket,link,workflow", ok=(0, 1, 8))
+    if proc.returncode and "no checks reported" in proc.stderr.lower():
+        return []
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise Stop((proc.stderr or "Checks returned invalid JSON")[-1500:])
+    if not isinstance(rows, list):
+        raise Stop("Checks returned an unexpected response")
+    return rows
+
+
+def threads(ctx):
+    owner, repo = ctx.slug.split("/")
+    cursor = None
+    rows = []
+    while True:
+        data = ctx.graphql('''query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+          repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
+            reviewThreads(first:100,after:$cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes { id isResolved isOutdated path line
+                comments(first:1) { nodes { body url } }
+              }
+            }
+          } }
+        }''', owner=owner, repo=repo, number=ctx.pr["number"], cursor=cursor)
+        conn = data["repository"]["pullRequest"]["reviewThreads"]
+        rows.extend(t for t in conn["nodes"] if not t["isResolved"])
+        page = conn["pageInfo"]
+        if not page["hasNextPage"]:
+            return rows
+        if not page["endCursor"] or page["endCursor"] == cursor:
+            raise Stop("Review thread pagination did not advance")
+        cursor = page["endCursor"]
+
+
+def classify(pr, rows, unresolved, local, base, remote, contains_base, dirty):
+    reasons = []
+    if pr["state"] != "OPEN":
+        return "BLOCKED", ["PR is no longer open"]
+    if dirty:
+        reasons.append("Commit task-owned changes or finish the active Git operation")
+    if local != pr["headRefOid"] or local != remote:
+        reasons.append("Sync local and published head")
+    if not contains_base or pr["baseRefOid"] != base or pr["mergeStateStatus"] == "BEHIND":
+        reasons.append("Sync with the current PR base")
+    if pr["isDraft"]:
+        reasons.append("Mark PR ready")
+    if pr["mergeable"] == "CONFLICTING" or pr["mergeStateStatus"] == "DIRTY":
+        reasons.append("Resolve merge conflicts")
+    if any(c["bucket"] in {"fail", "cancel"} for c in rows):
+        reasons.append("Fix failed/cancelled checks")
+    if unresolved:
+        reasons.append("Address unresolved review threads")
+    if reasons:
+        return "ACTION", reasons
+    if any(c["bucket"] not in {"pass", "skipping"} for c in rows):
+        return "WAITING", ["Checks are pending or unknown"]
+    if pr["reviewDecision"] in {"REVIEW_REQUIRED", "CHANGES_REQUESTED"}:
+        return "BLOCKED", ["Review approval or reviewer action required"]
+    if pr["mergeable"] == "UNKNOWN" or pr["mergeStateStatus"] == "UNKNOWN":
+        return "WAITING", ["GitHub is computing mergeability"]
+    if pr["mergeable"] == "MERGEABLE" and pr["mergeStateStatus"] == "CLEAN":
+        return "READY", []
+    return "BLOCKED", ["Inspect repository rules, required checks, deployments, reviews, and merge queue"]
+
+
+def snapshot(ctx):
+    before = ctx.view()
+    rows, unresolved, tips = parallel(lambda: checks(ctx), lambda: threads(ctx), ctx.fetch)
+    after = ctx.view()
+    base, remote = tips
+    # Any PR metadata change invalidates this observation, not just a changed SHA.
+    if before != after:
+        return "WAITING", dict(pr=after["url"], reasons=["PR changed during observation; retry"])
+    local = git("rev-parse", "HEAD")
+    try:
+        clean()
+        dirty = False
+    except Stop:
+        dirty = True
+    kind, reasons = classify(after, rows, unresolved, local, base, remote, ancestor(base, local), dirty)
+    counts = dict(Counter(c["bucket"] for c in rows))
+    details = [dict(id=t["id"], path=t["path"], line=t["line"], outdated=t["isOutdated"],
+                    excerpt=((t["comments"]["nodes"] or [{}])[0].get("body") or "")[:700],
+                    url=(t["comments"]["nodes"] or [{}])[0].get("url")) for t in unresolved]
+    return kind, dict(pr=after["url"], head=local, base=base, merge=after["mergeStateStatus"],
+                      review=after["reviewDecision"], checks=counts, reasons=reasons,
+                      failing=[c for c in rows if c["bucket"] in {"fail", "cancel"}],
+                      pending=[c for c in rows if c["bucket"] not in {"fail", "cancel", "pass", "skipping"}],
+                      threads=details)
+
+
+def status(ctx, seconds=0):
+    if not ctx.pr:
+        return emit("ACTION", next="upsert", branch=ctx.branch, base=ctx.base)
+    deadline = time.monotonic() + seconds
+    previous = None
+    delay = 5
+    while True:
+        kind, facts = snapshot(ctx)
+        signature = json.dumps([kind, facts], sort_keys=True)
+        if signature != previous:
+            emit(kind, **facts)
+        previous = signature
+        if kind != "WAITING" or time.monotonic() >= deadline:
+            return EXITS[kind]
+        time.sleep(min(delay, max(0, deadline - time.monotonic())))
+        delay = min(20, delay * 2)
+
+
+def actions_run_id(ctx, link):
+    url = urlparse(link)
+    match = re.fullmatch(r"/([^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?", url.path)
+    if url.hostname == ctx.host and match and match[1].lower() == ctx.slug.lower():
+        return match[2]
+    return None
+
+
+def verify_run(ctx, run_id, head):
+    info = ctx.api(f"repos/{ctx.slug}/actions/runs/{run_id}")
+    if info["head_sha"] != head:
+        raise Stop("Workflow run is not for the current PR head.", "BLOCKED")
+    associated = info.get("pull_requests") or []
+    if associated and not any(p["number"] == ctx.pr["number"] for p in associated):
+        raise Stop("Workflow run belongs to another PR.", "BLOCKED")
+    return info
+
+
+def logs(ctx, limit):
+    pr = ctx.view()
+    rows = checks(ctx)
+    ids = list(dict.fromkeys(filter(None, (actions_run_id(ctx, c["link"]) for c in rows
+                                          if c["bucket"] in {"fail", "cancel"}))))
+
+    def one(run_id):
+        info = verify_run(ctx, run_id, pr["headRefOid"])
+        folder = ctx.cache / "logs"
+        folder.mkdir(exist_ok=True)
+        path = folder / f"{run_id}-{info['run_attempt']}.log"
+        if not path.exists():
+            output = gh("run", "view", run_id, "--repo", ctx.selector,
+                        "--attempt", str(info["run_attempt"]), "--log-failed", timeout=120)
+            if info["status"] == "completed":
+                path.write_text(output)
+        else:
+            output = path.read_text()
+        lines = [line[:300] for line in output.splitlines() if re.search(
+            r"error|fail|exception|traceback|assert|panic|not ok", line, re.I)]
+        return dict(run=run_id, attempt=info["run_attempt"], path=str(path) if path.exists() else None,
+                    excerpt="\n".join(lines[-16:] or output.splitlines()[-16:])[-3000:])
+
+    chosen = ids[:limit]
+    results = parallel(*(lambda rid=rid: one(rid) for rid in chosen)) if chosen else []
+    return emit("DONE", logs=results, remaining=max(0, len(ids) - limit),
+                external=[c for c in rows if c["bucket"] in {"fail", "cancel"} and not actions_run_id(ctx, c["link"])])
+
+
+def published_head(ctx, expected):
+    clean()
+    pr = ctx.view()
+    remote = git("ls-remote", "--heads", ctx.remote, f"refs/heads/{ctx.branch}").split()
+    if pr["state"] != "OPEN" or pr["headRefOid"] != expected or git("rev-parse", "HEAD") != expected or not remote or remote[0] != expected:
+        raise Stop("Expected head does not match the open PR, remote, and clean local HEAD.", "WAITING")
+    return pr
+
+
+def rerun(ctx, run_id, expected):
+    published_head(ctx, expected)
+    rows = checks(ctx)
+    if run_id not in {actions_run_id(ctx, c["link"]) for c in rows if c["bucket"] in {"fail", "cancel"}}:
+        raise Stop("Run is not a current failed check of this PR.", "BLOCKED")
+    info = verify_run(ctx, run_id, expected)
+    if info["status"] != "completed":
+        raise Stop("Run is still active.", "WAITING")
+    ledger = ctx.cache / "reruns.json"
+    entries = json.loads(ledger.read_text()) if ledger.exists() else {}
+    key = f"{ctx.slug}:{expected}:{run_id}"
+    if key in entries:
+        raise Stop("A rerun was already attempted for this run/head; diagnose instead of looping.", "ACTION")
+    # Reserve before network mutation: ambiguous failures must not create repeat reruns.
+    entries[key] = dict(attempt=info["run_attempt"], requested_at=int(time.time()))
+    ledger.write_text(json.dumps(entries))
+    gh("run", "rerun", run_id, "--repo", ctx.selector, "--failed")
+    return emit("DONE", rerun=run_id, head=expected, next="wait")
+
+
+def resolve(ctx, thread_id, expected):
+    published_head(ctx, expected)
+    if thread_id not in {t["id"] for t in threads(ctx)}:
+        raise Stop("Thread is not unresolved on this PR.", "BLOCKED")
+    data = ctx.graphql('''mutation($id:ID!) {
+      resolveReviewThread(input:{threadId:$id}) { thread { isResolved } }
+    }''', id=thread_id)
+    if not data["resolveReviewThread"]["thread"]["isResolved"]:
+        raise Stop("GitHub did not resolve the thread")
+    return emit("DONE", resolved=thread_id, head=expected, next="status")
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    subs = p.add_subparsers(dest="command", required=True)
+    for name in ("status", "sync", "upsert", "wait", "logs", "rerun", "resolve"):
+        sub = subs.add_parser(name)
+        sub.add_argument("--base", help="select the intended base; never retargets an existing PR")
+        if name == "upsert":
+            sub.add_argument("--title-file")
+            sub.add_argument("--body-file")
+        if name == "wait":
+            sub.add_argument("--seconds", type=int, default=45, choices=range(0, 61), metavar="0..60")
+        if name == "logs":
+            sub.add_argument("--limit", type=int, default=4, choices=range(1, 21), metavar="1..20")
+        if name in {"rerun", "resolve"}:
+            sub.add_argument("id")
+            sub.add_argument("--expected-head", required=True)
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        ctx = Context(args.base)
+        if args.command in {"status", "wait"}:
+            return status(ctx, getattr(args, "seconds", 0))
+        if args.command == "logs":
+            return logs(ctx, args.limit)
+        with mutation_lock(ctx):
+            if args.command == "sync":
+                return emit("DONE", head=sync(ctx), next="status")
+            if args.command == "upsert":
+                return upsert(ctx, args)
+            if args.command == "rerun":
+                if not args.id.isdigit():
+                    raise Stop("Run ID must be numeric")
+                return rerun(ctx, args.id, args.expected_head)
+            return resolve(ctx, args.id, args.expected_head)
+    except Stop as exc:
+        return emit(exc.kind, reason=str(exc))
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
+        return emit("ERROR", reason=str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
