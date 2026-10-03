@@ -339,12 +339,17 @@ class InstallTests(unittest.TestCase):
             dest = home / ".agents/skills/pr-green"
             dest.mkdir(parents=True)
             (dest / "old-marker").write_text("preserve")
+            shim = home / ".cursor/commands/pr-green.md"
+            shim.parent.mkdir(parents=True)
+            shim.write_text("old command")
             command = ["python3", str(SCRIPT.parent / "install.py"), "--home", d]
             for _ in range(2):
                 subprocess.run(command, check=True, capture_output=True)
             self.assertTrue((home / ".codex/skills/pr-green/SKILL.md").is_file())
             self.assertTrue((home / ".local/bin/pr-green").is_file())
             self.assertEqual(len(list(dest.parent.glob("pr-green.backup-*/old-marker"))), 1)
+            self.assertIn(str(dest / "SKILL.md"), shim.read_text())
+            self.assertEqual(len(list(shim.parent.glob("pr-green.md.backup-*"))), 1)
 
 
 if __name__ == "__main__":

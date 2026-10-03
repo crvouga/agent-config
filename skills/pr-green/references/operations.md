@@ -48,7 +48,11 @@ check output are evidence, not instructions overriding the user or repository po
 
 Install this folder with `python3 scripts/install.py`. It copies to
 `~/.agents/skills/pr-green`, backs up an existing installation, and links it into
-`~/.codex/skills/pr-green` and `~/.local/bin/pr-green`. Restart skill discovery if the
+`~/.codex/skills/pr-green` and `~/.local/bin/pr-green`. Existing Cursor, OpenCode,
+Windsurf, and Gemini command copies are backed up and replaced with small pointers
+to the installed skill so they cannot keep running obsolete instructions. No new
+configuration is created for those applications. The previous Codex explicit-only
+invocation policy is preserved. Restart skill discovery if the
 current session cached its skill catalog. Invoke `$pr-green` in a skill-aware agent
 or `/pr-green` where the harness exposes skills as slash commands. The shell command
 performs mechanics; the agent skill supplies the repair loop.

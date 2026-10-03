@@ -2,6 +2,7 @@
 """Install a stable copy, preserving the previous installation and command links."""
 import argparse
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import shutil
 
@@ -23,6 +24,22 @@ def link(target, dest):
     print(f"Linked {dest}")
 
 
+def refresh_existing_commands(home, skill):
+    prompt = f"Read and follow the PR green skill at {skill / 'SKILL.md'}. Apply the user's arguments and constraints."
+    markdown = "---\ndescription: Get the current branch's PR ready to merge\n---\n\n" + prompt + "\n"
+    paths = {
+        home / ".cursor/commands/pr-green.md": markdown,
+        home / ".config/opencode/commands/pr-green.md": markdown,
+        home / ".codeium/windsurf/windsurf/workflows/pr-green.md": markdown.replace("---\ndescription", "---\nauto_execution_mode: 0\ndescription", 1),
+        home / ".gemini/commands/pr-green.toml": 'description = "Get the current branch PR ready to merge"\nprompt = ' + json.dumps(prompt + "\nUser arguments: {{args}}\n") + "\n",
+    }
+    for path, content in paths.items():
+        if path.is_file() and path.read_text() != content:
+            backup(path)
+            path.write_text(content)
+            print(f"Refreshed {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home(), help="installation home (also useful for testing)")
@@ -36,6 +53,7 @@ def main():
     (dest / "scripts/pr-green").chmod(0o755)
     link(dest, args.home / ".codex/skills/pr-green")
     link(dest / "scripts/pr-green", args.home / ".local/bin/pr-green")
+    refresh_existing_commands(args.home, dest)
     print(f"Installed {dest}")
 
 
